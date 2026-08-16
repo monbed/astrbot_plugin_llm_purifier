@@ -23,7 +23,7 @@ NESTED_LIST_PATTERN = re.compile(r"^(?: {2,}|\t+)(?:[-*+]|\d+[.)])\s+\S", re.MUL
 
 T2I_FLAG_KEY = "llm_purifier_force_t2i"
 
-@register("astrbot_plugin_llm_purifier", "monbed", "净化LLM输出：移除思考过程与Markdown标记，复杂格式自动转图片发送", "0.2.0", "https://github.com/monbed/astrbot_plugin_llm_purifier")
+@register("astrbot_plugin_llm_purifier", "monbed", "净化LLM输出：移除思考过程与Markdown标记，复杂格式自动转图片发送", "0.2.1", "https://github.com/monbed/astrbot_plugin_llm_purifier")
 class LLMPurifierPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -114,28 +114,34 @@ class LLMPurifierPlugin(Star):
 
         # 移除行内代码 `code` -> code
         text = re.sub(r"`([^`]+)`", r"\1", text)
-        
+
+        # 移除图片 ![alt](url) -> alt (提前于普通链接处理避免残留 "!")
+        text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+
+        # 移除链接 [text](url) -> text
+        text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+
         # 移除粗体/斜体 - 优化以避免误伤数学公式
-        # Bold: **text** or __text__
-        text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
-        text = re.sub(r"__([^_]+)__", r"\1", text)
-        
+        # Bold: **text** or __text__ (非贪婪，支持内部含特殊符号)
+        text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+        text = re.sub(r"__(.*?)__", r"\1", text)
+
         # Italic: *text* or _text_
         # 严格模式: * 前后不能有空格 (CommonMark 标准)，且 * 必须位于词边界或非单词字符旁
         text = re.sub(r"(^|[^\w\*])\*(?!\s)([^*]+)(?<!\s)\*(?=$|[^\w\*])", r"\1\2", text)
         text = re.sub(r"(^|[^\w_])_(?!\s)([^_]+)(?<!\s)_(?=$|[^\w_])", r"\1\2", text)
-        
+
+        # 移除删除线 ~~text~~ -> text
+        text = re.sub(r"~~(.*?)~~", r"\1", text)
+
         # 移除标题 (移除 # 但保留文本)
         text = re.sub(r"^(#{1,6})\s+(.*)", r"\2", text, flags=re.MULTILINE)
-        
-        # 移除引用 (移除 > 但保留文本)
-        text = re.sub(r"^>\s+(.*)", r"\1", text, flags=re.MULTILINE)
-        
-        # 移除链接 [text](url) -> text
-        text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-        
-        # 移除列表标记 (移除行首的 - 或 *)
-        text = re.sub(r"^\s*[-*]\s+(.*)", r"\1", text, flags=re.MULTILINE)
+
+        # 移除引用 (处理嵌套情况: >>> text -> text)
+        text = re.sub(r"^(?:>\s*)+(.*)", r"\1", text, flags=re.MULTILINE)
+
+        # 移除列表标记 (移除行首的 -, *, +)
+        text = re.sub(r"^\s*[-*+]\s+(.*)", r"\1", text, flags=re.MULTILINE)
         
         return text
 
