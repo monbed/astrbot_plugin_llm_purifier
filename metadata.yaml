@@ -1,6 +1,6 @@
 name: astrbot_plugin_llm_purifier
-version: 0.0.6
+version: 0.2.0
 author: monbed
-desc: 移除LLM输出中的思考过程与Markdown格式
+desc: 净化 LLM 输出：移除思考过程与 Markdown 标记；检测到公式、表格、代码块等复杂格式时自动整段转图片发送
 repo: https://github.com/monbed/astrbot_plugin_llm_purifier
-display_name: LLM净化器
+display_name: LLM输出净化与转图

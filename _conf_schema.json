@@ -1,0 +1,51 @@
+{
+    "remove_thinking": {
+        "type": "bool",
+        "description": "移除思考过程",
+        "hint": "过滤 <think> 标签及开头以英文为主的思考段落",
+        "default": true
+    },
+    "remove_markdown": {
+        "type": "bool",
+        "description": "净化 Markdown 格式",
+        "hint": "移除粗体、标题、链接、列表标记等 Markdown 符号（仅对未触发转图的纯文本回复生效）",
+        "default": true
+    },
+    "t2i": {
+        "type": "object",
+        "description": "复杂格式整段转图",
+        "hint": "检测到勾选的格式时，保留排版并通过 AstrBot 官方文转图流程整段渲染为图片发送",
+        "items": {
+            "enable": {
+                "type": "bool",
+                "description": "启用转图",
+                "hint": "总开关，关闭后以下分类检测全部失效",
+                "default": true
+            },
+            "formula": {
+                "type": "bool",
+                "description": "数学公式",
+                "hint": "$$...$$、\\[...\\]、\\(...\\)、常见 LaTeX 命令、含命令或上下标的行内 $...$",
+                "default": true
+            },
+            "table": {
+                "type": "bool",
+                "description": "表格",
+                "hint": "Markdown 表格与 HTML <table>",
+                "default": true
+            },
+            "code_block": {
+                "type": "bool",
+                "description": "多行代码块",
+                "hint": "```...``` 围栏且内部含换行（单行行内代码不触发）",
+                "default": true
+            },
+            "nested_list": {
+                "type": "bool",
+                "description": "多级嵌套列表",
+                "hint": "存在缩进的子列表项（平级列表不触发）",
+                "default": true
+            }
+        }
+    }
+}

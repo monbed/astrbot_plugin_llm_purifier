@@ -1,37 +1,107 @@
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api.provider import LLMResponse
-from astrbot.api import logger
+from astrbot.api import logger, AstrBotConfig
 import re
 
-@register("astrbot_plugin_llm_purifier", "monbed", "移除LLM输出中的思考过程与Markdown格式", "0.0.6", "https://github.com/monbed/astrbot_plugin_llm_purifier")
-class ThinkingKillerPlugin(Star):
-    def __init__(self, context: Context):
+# 公式检测：$$...$$、\[...\]、\(...\)、常见 LaTeX 命令、行内 $...$（内含反斜杠命令或 ^/_ 上下标）
+FORMULA_PATTERN = re.compile(
+    r"\$\$[\s\S]+?\$\$"
+    r"|\\\[[\s\S]+?\\\]"
+    r"|\\\([\s\S]+?\\\)"
+    r"|\\(?:frac|sum|int|sqrt|prod|lim|begin|alpha|beta|gamma|theta|pi|infty|cdot|times|leq|geq|neq|partial|nabla)\b"
+    r"|\$[^$\n]*(?:\\[a-zA-Z]+|[_^]\{)[^$\n]*\$"
+)
+# 表格检测：Markdown 表格的表头分隔行（如 | --- | :---: |）
+TABLE_PATTERN = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$", re.MULTILINE)
+# 多行代码块检测：```...``` 且内部含换行（单行行内围栏不算，剥离后代码缩进会丢失）
+CODE_BLOCK_PATTERN = re.compile(r"```[^\n]*\n[\s\S]*?```")
+# HTML 表格检测
+HTML_TABLE_PATTERN = re.compile(r"<table[\s>]", re.IGNORECASE)
+# 嵌套列表检测：某行是缩进（≥2 空格或 Tab）的列表项，说明存在多级列表，剥离后层级会丢失
+NESTED_LIST_PATTERN = re.compile(r"^(?: {2,}|\t+)(?:[-*+]|\d+[.)])\s+\S", re.MULTILINE)
+
+T2I_FLAG_KEY = "llm_purifier_force_t2i"
+
+@register("astrbot_plugin_llm_purifier", "monbed", "净化LLM输出：移除思考过程与Markdown标记，复杂格式自动转图片发送", "0.2.0", "https://github.com/monbed/astrbot_plugin_llm_purifier")
+class LLMPurifierPlugin(Star):
+    def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
-    
+        self.config = config or {}
+
+    def _cfg(self, key: str, default: bool = True) -> bool:
+        v = self.config.get(key)
+        return default if v is None else bool(v)
+
+    def _t2i_cfg(self, key: str) -> bool:
+        t2i = self.config.get("t2i") or {}
+        v = t2i.get(key)
+        return True if v is None else bool(v)
+
+    def has_rich_content(self, text: str) -> bool:
+        """按配置检测文本中是否含有公式、表格、多行代码块或嵌套列表等剥离后难以阅读的格式"""
+        if not self._t2i_cfg("enable"):
+            return False
+        if self._t2i_cfg("formula") and FORMULA_PATTERN.search(text):
+            return True
+        if self._t2i_cfg("table") and (TABLE_PATTERN.search(text) or HTML_TABLE_PATTERN.search(text)):
+            return True
+        if self._t2i_cfg("code_block") and CODE_BLOCK_PATTERN.search(text):
+            return True
+        if self._t2i_cfg("nested_list") and NESTED_LIST_PATTERN.search(text):
+            return True
+        return False
+
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse, *args):
         """
-        监听LLM回复，先移除思考过程，再移除Markdown格式
+        监听LLM回复，按配置移除思考过程、净化Markdown；
+        若含公式/表格等复杂格式，则保留 Markdown 并标记整段转图片发送
         """
         if not resp or not resp.completion_text:
             return
 
         original_text = resp.completion_text
-        
-        # 1. 先移除思考过程
-        no_thinking_text = self.remove_thinking(original_text)
-        
-        # 2. 再移除Markdown格式
-        cleaned_text = self.remove_markdown(no_thinking_text)
+
+        # 1. 先移除思考过程（可配置）
+        if self._cfg("remove_thinking"):
+            no_thinking_text = self.remove_thinking(original_text)
+        else:
+            no_thinking_text = original_text
+
+        # 2. 含公式/表格时不剥离 Markdown，改走官方文转图（保留排版供渲染）
+        if self.has_rich_content(no_thinking_text):
+            if original_text != no_thinking_text:
+                resp.completion_text = no_thinking_text
+            event.set_extra(T2I_FLAG_KEY, True)
+            logger.info("[LLM Purifier] 检测到公式/表格等复杂格式，保留 Markdown 并标记文转图发送")
+            return
+
+        # 3. 再移除Markdown格式（可配置）
+        if self._cfg("remove_markdown"):
+            cleaned_text = self.remove_markdown(no_thinking_text)
+        else:
+            cleaned_text = no_thinking_text
         
         if cleaned_text and original_text != cleaned_text:
             resp.completion_text = cleaned_text
             # 使用 logger 提醒
             original_preview = original_text[:50].replace('\n', '\\n')
             cleaned_preview = cleaned_text[:50].replace('\n', '\\n')
-            log_msg = f"\n[Thinking & MD Killer] --------------------------------------------------\n[Thinking & MD Killer] 检测到特定格式并移除:\n[Thinking & MD Killer] 原文: {original_preview}...\n[Thinking & MD Killer] 处理: {cleaned_preview}...\n[Thinking & MD Killer] --------------------------------------------------"
+            log_msg = f"\n[LLM Purifier] --------------------------------------------------\n[LLM Purifier] 检测到特定格式并移除:\n[LLM Purifier] 原文: {original_preview}...\n[LLM Purifier] 处理: {cleaned_preview}...\n[LLM Purifier] --------------------------------------------------"
             logger.warning(log_msg)
+
+    @filter.on_decorating_result()
+    async def on_decorating(self, event: AstrMessageEvent):
+        """
+        发送前修饰：若本事件被标记为含公式/表格，
+        对结果打 use_t2i 标记，交由框架官方文转图流程（跟随 WebUI 可选的 t2i 模板）整段渲染为图片
+        """
+        if not event.get_extra(T2I_FLAG_KEY):
+            return
+        result = event.get_result()
+        if result and result.chain:
+            result.use_t2i(True)
 
     def remove_markdown(self, text: str) -> str:
         """
