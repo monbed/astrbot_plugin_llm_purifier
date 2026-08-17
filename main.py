@@ -1,6 +1,7 @@
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api.provider import LLMResponse
+from astrbot.api.message_components import Image, Plain
 from astrbot.api import logger, AstrBotConfig
 import re
 
@@ -23,7 +24,7 @@ NESTED_LIST_PATTERN = re.compile(r"^(?: {2,}|\t+)(?:[-*+]|\d+[.)])\s+\S", re.MUL
 
 T2I_FLAG_KEY = "llm_purifier_force_t2i"
 
-@register("astrbot_plugin_llm_purifier", "monbed", "净化LLM输出：移除思考过程与Markdown标记，复杂格式自动转图片发送", "0.2.3", "https://github.com/monbed/astrbot_plugin_llm_purifier")
+@register("astrbot_plugin_llm_purifier", "monbed", "净化LLM输出：移除思考过程与Markdown标记，复杂格式自动转图片发送", "0.2.4", "https://github.com/monbed/astrbot_plugin_llm_purifier")
 class LLMPurifierPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -94,14 +95,30 @@ class LLMPurifierPlugin(Star):
     @filter.on_decorating_result()
     async def on_decorating(self, event: AstrMessageEvent):
         """
-        发送前修饰：若本事件被标记为含公式/表格，
-        对结果打 use_t2i 标记，交由框架官方文转图流程（跟随 WebUI 可选的 t2i 模板）整段渲染为图片
+        发送前修饰：若本事件被标记为含公式/表格，直接调用官方文转图渲染
+        （self.text_to_image，跟随 WebUI 可选的 t2i 模板）并替换消息链为图片。
+        不走框架的 use_t2i 标记，以绕过其 t2i_word_threshold 字数阈值（短文本会被跳过）。
         """
         if not event.get_extra(T2I_FLAG_KEY):
             return
         result = event.get_result()
-        if result and result.chain:
-            result.use_t2i(True)
+        if not result or not result.chain:
+            return
+        texts = [c.text for c in result.chain if isinstance(c, Plain)]
+        others = [c for c in result.chain if not isinstance(c, Plain)]
+        text = "\n".join(t for t in texts if t and t.strip())
+        if not text:
+            return
+        try:
+            url = await self.text_to_image(text, return_url=True)
+        except Exception as e:
+            logger.error(f"[LLM Purifier] 文转图渲染失败，回退为文本发送: {e}")
+            return
+        if not url:
+            return
+        # 与框架 ResultDecorateStage 相同的结果组装方式
+        img = Image.fromURL(url) if url.startswith("http") else Image.fromFileSystem(url)
+        result.chain = [img] + others
 
     def remove_markdown(self, text: str) -> str:
         """
