@@ -62,8 +62,8 @@
             "scale": {
                 "type": "string",
                 "description": "渲染缩放倍率",
-                "options": ["normal", "ultra"],
-                "hint": "ultra 为高倍率采样，文字更锐利，图片更大",
+                "options": ["normal", "high", "ultra"],
+                "hint": "设备像素比：normal=1.0 / high=1.3 / ultra=1.8，越高文字越锐利、图片越大",
                 "default": "ultra"
             },
             "viewport_width": {
