@@ -24,7 +24,7 @@ NESTED_LIST_PATTERN = re.compile(r"^(?: {2,}|\t+)(?:[-*+]|\d+[.)])\s+\S", re.MUL
 
 T2I_FLAG_KEY = "llm_purifier_force_t2i"
 
-@register("astrbot_plugin_llm_purifier", "monbed", "净化LLM输出：移除思考过程与Markdown标记，复杂格式自动转图片发送", "0.2.4", "https://github.com/monbed/astrbot_plugin_llm_purifier")
+@register("astrbot_plugin_llm_purifier", "monbed", "净化LLM输出：移除思考过程与Markdown标记，复杂格式自动转图片发送", "0.3.0", "https://github.com/monbed/astrbot_plugin_llm_purifier")
 class LLMPurifierPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -92,12 +92,57 @@ class LLMPurifierPlugin(Star):
             log_msg = f"\n[LLM Purifier] --------------------------------------------------\n[LLM Purifier] 检测到特定格式并移除:\n[LLM Purifier] 原文: {original_preview}...\n[LLM Purifier] 处理: {cleaned_preview}...\n[LLM Purifier] --------------------------------------------------"
             logger.warning(log_msg)
 
+    def _build_render_options(self) -> dict:
+        """按配置组装渲染参数（透传给官方 t2i 渲染端点）"""
+        t2i = self.config.get("t2i") or {}
+        img_type = t2i.get("image_type") or "png"
+        try:
+            viewport_width = int(t2i.get("viewport_width") or 1080)
+            viewport_height = int(t2i.get("viewport_height") or 900)
+        except (TypeError, ValueError):
+            viewport_width, viewport_height = 1080, 900
+        options = {
+            "full_page": True,
+            "type": img_type,
+            "device_scale_factor_level": t2i.get("scale") or "ultra",
+            "viewport_width": viewport_width,
+            "viewport_height": viewport_height,
+        }
+        if img_type == "jpeg":
+            try:
+                options["quality"] = min(100, max(1, int(t2i.get("quality") or 90)))
+            except (TypeError, ValueError):
+                options["quality"] = 90
+        return options
+
+    async def _render_high_quality(self, text: str) -> str | None:
+        """取当前生效的官方 t2i 模板，带高清参数渲染"""
+        from astrbot.api import html_renderer
+
+        template_name = "base"
+        try:
+            template_name = (
+                self.context.get_config().get("t2i_active_template") or "base"
+            )
+        except Exception:
+            pass
+        tmpl_str = await html_renderer.network_strategy.get_template(template_name)
+        data = {"text": text, "version": ""}
+        try:
+            from astrbot.core.config import VERSION
+            data["version"] = f"v{VERSION}"
+        except Exception:
+            pass
+        return await self.html_render(
+            tmpl_str, data, return_url=True, options=self._build_render_options()
+        )
+
     @filter.on_decorating_result()
     async def on_decorating(self, event: AstrMessageEvent):
         """
-        发送前修饰：若本事件被标记为含公式/表格，直接调用官方文转图渲染
-        （self.text_to_image，跟随 WebUI 可选的 t2i 模板）并替换消息链为图片。
-        不走框架的 use_t2i 标记，以绕过其 t2i_word_threshold 字数阈值（短文本会被跳过）。
+        发送前修饰：若本事件被标记为含公式/表格，直接调用官方渲染接口
+        （跟随 WebUI 可选的 t2i 模板）按配置的清晰度参数渲染，并替换消息链为图片。
+        不走框架的 use_t2i 标记，以绕过其 t2i_word_threshold 字数阈值与写死的 quality=40。
         """
         if not event.get_extra(T2I_FLAG_KEY):
             return
@@ -109,11 +154,17 @@ class LLMPurifierPlugin(Star):
         text = "\n".join(t for t in texts if t and t.strip())
         if not text:
             return
+        url = None
         try:
-            url = await self.text_to_image(text, return_url=True)
+            url = await self._render_high_quality(text)
         except Exception as e:
-            logger.error(f"[LLM Purifier] 文转图渲染失败，回退为文本发送: {e}")
-            return
+            logger.warning(f"[LLM Purifier] 高清渲染失败，回退官方默认渲染: {e}")
+        if not url:
+            try:
+                url = await self.text_to_image(text, return_url=True)
+            except Exception as e:
+                logger.error(f"[LLM Purifier] 文转图渲染失败，回退为文本发送: {e}")
+                return
         if not url:
             return
         # 与框架 ResultDecorateStage 相同的结果组装方式

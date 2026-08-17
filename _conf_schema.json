@@ -45,6 +45,38 @@
                 "description": "多级嵌套列表",
                 "hint": "存在缩进的子列表项（平级列表不触发）",
                 "default": false
+            },
+            "image_type": {
+                "type": "string",
+                "description": "图片格式",
+                "options": ["png", "jpeg"],
+                "hint": "png 无损最清晰；jpeg 体积更小（配合下方质量参数）",
+                "default": "png"
+            },
+            "quality": {
+                "type": "int",
+                "description": "JPEG 质量 (1-100)",
+                "hint": "仅图片格式为 jpeg 时生效；框架默认仅 40，建议 85-95",
+                "default": 90
+            },
+            "scale": {
+                "type": "string",
+                "description": "渲染缩放倍率",
+                "options": ["normal", "ultra"],
+                "hint": "ultra 为高倍率采样，文字更锐利，图片更大",
+                "default": "ultra"
+            },
+            "viewport_width": {
+                "type": "int",
+                "description": "视口宽度 (px)",
+                "hint": "渲染页面宽度，决定图片宽度与排版换行",
+                "default": 1080
+            },
+            "viewport_height": {
+                "type": "int",
+                "description": "视口高度 (px)",
+                "hint": "初始高度；实际按整页内容截图，一般无需调整",
+                "default": 900
             }
         }
     }

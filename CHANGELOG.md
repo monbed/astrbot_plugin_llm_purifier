@@ -1,5 +1,17 @@
 # 更新日志
 
+## 0.3.0 (2026-08-18)
+
+### 新增
+- 转图清晰度可在面板配置（`t2i` 配置组新增五项，参考 astrbot_plugin_qq_group_daily_analysis 的渲染参数方式）：
+  - `image_type`：图片格式 png（无损，默认）/ jpeg；
+  - `quality`：JPEG 质量 1-100（默认 90，框架原默认仅 40）；
+  - `scale`：渲染缩放倍率 normal / ultra（默认 ultra，高倍采样更锐利）；
+  - `viewport_width` / `viewport_height`：渲染视口宽高（默认 1080×900，宽度决定图片宽度与换行）。
+
+### 变更
+- 转图改为获取当前生效的官方 t2i 模板后调用 `html_render` 并透传上述参数（此前 `text_to_image` 链路无法传参，画质被框架写死在 JPEG quality=40）；高清渲染失败时依次回退：官方默认渲染 → 原文本发送。
+
 ## 0.2.4 (2026-08-18)
 
 ### 修复
