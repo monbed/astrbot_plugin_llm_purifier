@@ -2,8 +2,8 @@
     "remove_thinking": {
         "type": "bool",
         "description": "移除思考过程",
-        "hint": "过滤 <think> 标签及开头以英文为主的思考段落",
-        "default": true
+        "hint": "过滤开头以英文为主的无标签思考段落",
+        "default": false
     },
     "remove_markdown": {
         "type": "bool",
@@ -44,7 +44,7 @@
                 "type": "bool",
                 "description": "多级嵌套列表",
                 "hint": "存在缩进的子列表项（平级列表不触发）",
-                "default": true
+                "default": false
             }
         }
     }

@@ -23,7 +23,7 @@ NESTED_LIST_PATTERN = re.compile(r"^(?: {2,}|\t+)(?:[-*+]|\d+[.)])\s+\S", re.MUL
 
 T2I_FLAG_KEY = "llm_purifier_force_t2i"
 
-@register("astrbot_plugin_llm_purifier", "monbed", "净化LLM输出：移除思考过程与Markdown标记，复杂格式自动转图片发送", "0.2.1", "https://github.com/monbed/astrbot_plugin_llm_purifier")
+@register("astrbot_plugin_llm_purifier", "monbed", "净化LLM输出：移除思考过程与Markdown标记，复杂格式自动转图片发送", "0.2.3", "https://github.com/monbed/astrbot_plugin_llm_purifier")
 class LLMPurifierPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -33,10 +33,10 @@ class LLMPurifierPlugin(Star):
         v = self.config.get(key)
         return default if v is None else bool(v)
 
-    def _t2i_cfg(self, key: str) -> bool:
+    def _t2i_cfg(self, key: str, default: bool = True) -> bool:
         t2i = self.config.get("t2i") or {}
         v = t2i.get(key)
-        return True if v is None else bool(v)
+        return default if v is None else bool(v)
 
     def has_rich_content(self, text: str) -> bool:
         """按配置检测文本中是否含有公式、表格、多行代码块或嵌套列表等剥离后难以阅读的格式"""
@@ -48,7 +48,7 @@ class LLMPurifierPlugin(Star):
             return True
         if self._t2i_cfg("code_block") and CODE_BLOCK_PATTERN.search(text):
             return True
-        if self._t2i_cfg("nested_list") and NESTED_LIST_PATTERN.search(text):
+        if self._t2i_cfg("nested_list", False) and NESTED_LIST_PATTERN.search(text):
             return True
         return False
 
@@ -63,8 +63,8 @@ class LLMPurifierPlugin(Star):
 
         original_text = resp.completion_text
 
-        # 1. 先移除思考过程（可配置）
-        if self._cfg("remove_thinking"):
+        # 1. 先移除思考过程（可配置，默认关闭）
+        if self._cfg("remove_thinking", False):
             no_thinking_text = self.remove_thinking(original_text)
         else:
             no_thinking_text = original_text
@@ -151,10 +151,7 @@ class LLMPurifierPlugin(Star):
         处理逻辑：将文本按空行分段，移除开头那些以英文为主的段落（思考过程），
         直到遇到第一个以中文为主的段落，将其作为正式回复的起点。
         """
-        # 1. 移除 <think>...</think> 标签及其内容 (兼容带标准thought标签的模型)
-        text = re.sub(r"<think>[\s\S]*?</think>\s*", "", text)
-        
-        # 2. 针对无标签的样本格式：按连续换行分割为多个段落
+        # 针对无标签的样本格式：按连续换行分割为多个段落
         paragraphs = re.split(r'\n(?:\s*\n)+', text)
         start_idx = 0
         
