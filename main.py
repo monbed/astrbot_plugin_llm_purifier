@@ -1,8 +1,9 @@
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.api.provider import LLMResponse
-from astrbot.api.message_components import Image, Plain
+from astrbot.api.message_components import At, Image, Plain
 from astrbot.api import logger, AstrBotConfig
+from collections import OrderedDict
 import re
 
 # 公式检测：$$...$$、\[...\]、\(...\)、常见 LaTeX 命令、行内 $...$（内含反斜杠命令或 ^/_ 上下标）
@@ -24,11 +25,12 @@ NESTED_LIST_PATTERN = re.compile(r"^(?: {2,}|\t+)(?:[-*+]|\d+[.)])\s+\S", re.MUL
 
 T2I_FLAG_KEY = "llm_purifier_force_t2i"
 
-@register("astrbot_plugin_llm_purifier", "monbed", "净化LLM输出：移除思考过程与Markdown标记，复杂格式自动转图片发送", "0.3.0", "https://github.com/monbed/astrbot_plugin_llm_purifier")
 class LLMPurifierPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.config = config or {}
+        # 群昵称到账号的短期缓存，用于把模型输出的“@昵称”解析成真正的 At。
+        self._group_name_to_qq: dict[str, OrderedDict[str, str]] = {}
 
     def _cfg(self, key: str, default: bool = True) -> bool:
         v = self.config.get(key)
@@ -38,6 +40,105 @@ class LLMPurifierPlugin(Star):
         t2i = self.config.get("t2i") or {}
         v = t2i.get(key)
         return default if v is None else bool(v)
+
+    def _get_group_cache(self, group_id) -> OrderedDict[str, str]:
+        key = str(group_id or "")
+        cache = self._group_name_to_qq.get(key)
+        if cache is None:
+            cache = OrderedDict()
+            self._group_name_to_qq[key] = cache
+        return cache
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
+    async def on_group_message(self, event: AstrMessageEvent):
+        """记录群里最近出现的昵称和账号，供句首假 @ 解析使用。"""
+        group_id = event.get_group_id()
+        sender_id = event.get_sender_id()
+        sender_name = event.get_sender_name()
+        if not group_id or sender_id is None or not sender_name:
+            return
+        name = str(sender_name).strip()
+        if not name:
+            return
+
+        cache = self._get_group_cache(group_id)
+        cache[name] = str(sender_id)
+        cache.move_to_end(name)
+        while len(cache) > 100:
+            cache.popitem(last=False)
+
+    @staticmethod
+    def _at_head_match(text: str):
+        """匹配参考插件支持的句首假 @ 写法。"""
+        return re.match(
+            r"^\s*(?:"
+            r"\[at[:：]\s*(\d+)\]"
+            r"|\[at[:：]\s*([^\]]+)\]"
+            r"|@(\d{5,12})"
+            r"|@([\u4e00-\u9fa5\w-]{2,20})"
+            r")\s*",
+            text,
+            re.IGNORECASE,
+        )
+
+    def _insert_at(self, chain, qq=None):
+        """在第一段文本前插入真实 At。"""
+        for index, component in enumerate(chain):
+            if not isinstance(component, Plain):
+                continue
+            if qq:
+                # 零宽字符可避免部分平台吞掉 At 后紧邻文本的首字符。
+                chain.insert(index, At(qq=qq))
+                chain.insert(index + 1, Plain("\u200b"))
+            return
+        if qq:
+            chain.append(At(qq=qq))
+
+    def _parse_fake_at(self, event, chain):
+        """返回 (文本组件索引, QQ号)，不修改消息链。"""
+        try:
+            group_id = event.get_group_id()
+        except Exception:
+            group_id = ""
+        cache = self._get_group_cache(group_id)
+
+        for index, component in enumerate(chain):
+            if not isinstance(component, Plain) or not component.text:
+                continue
+            match = self._at_head_match(component.text)
+            if not match:
+                return None, None
+
+            qq = match.group(1) or match.group(3)
+            nickname = match.group(2) or match.group(4)
+            if not qq and nickname:
+                qq = cache.get(nickname.strip())
+            return index, qq
+
+        return None, None
+
+    def _apply_fake_at(self, chain, index, qq):
+        if index is None or index >= len(chain):
+            return
+        component = chain[index]
+        if not isinstance(component, Plain):
+            return
+
+        match = self._at_head_match(component.text)
+        if not match or not qq:
+            return
+        component.text = component.text[match.end() :]
+        if not component.text:
+            chain.pop(index)
+        self._insert_at(chain, qq=qq)
+
+    def _process_at(self, event, result):
+        """将 LLM 输出句首的假 @ 转换成真实 At 组件。"""
+        if not result.chain or not result.is_llm_result():
+            return
+
+        index, qq = self._parse_fake_at(event, result.chain)
+        self._apply_fake_at(result.chain, index, qq)
 
     def has_rich_content(self, text: str) -> bool:
         """按配置检测文本中是否含有公式、表格、多行代码块或嵌套列表等剥离后难以阅读的格式"""
@@ -144,13 +245,15 @@ class LLMPurifierPlugin(Star):
         （跟随 WebUI 可选的 t2i 模板）按配置的清晰度参数渲染，并替换消息链为图片。
         不走框架的 use_t2i 标记，以绕过其 t2i_word_threshold 字数阈值与写死的 quality=40。
         """
-        if not event.get_extra(T2I_FLAG_KEY):
-            return
         result = event.get_result()
         if not result or not result.chain:
             return
+
+        if not event.get_extra(T2I_FLAG_KEY):
+            self._process_at(event, result)
+            return
+
         texts = [c.text for c in result.chain if isinstance(c, Plain)]
-        others = [c for c in result.chain if not isinstance(c, Plain)]
         text = "\n".join(t for t in texts if t and t.strip())
         if not text:
             return
@@ -169,6 +272,7 @@ class LLMPurifierPlugin(Star):
             return
         # 与框架 ResultDecorateStage 相同的结果组装方式
         img = Image.fromURL(url) if url.startswith("http") else Image.fromFileSystem(url)
+        others = [c for c in result.chain if not isinstance(c, Plain)]
         result.chain = [img] + others
 
     def remove_markdown(self, text: str) -> str:
