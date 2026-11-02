@@ -304,25 +304,43 @@ class LLMPurifierPlugin(Star):
                 new_chain.append(comp)
 
         if changed:
+            original = "".join(t for t in texts)
             result.chain = self._tidy_at_spacing(new_chain)
-            logger.info(
-                "[LLM Purifier] 已将假 @ 转换为真实 At: "
-                + ", ".join(str(c.qq) for c in result.chain if isinstance(c, At))
+            targets = ", ".join(str(c.qq) for c in result.chain if isinstance(c, At))
+            self._log_box(
+                "检测到假 @ 并转换为真实 At:",
+                [f"原文: {self._preview(original)}", f"At 对象: {targets}"],
             )
+
+    @staticmethod
+    def _log_box(title: str, lines: list[str]) -> None:
+        """与 Markdown 净化相同的黄色分隔框日志。"""
+        sep = "[LLM Purifier] --------------------------------------------------"
+        body = "\n".join(f"[LLM Purifier] {line}" for line in lines)
+        logger.warning(f"\n{sep}\n[LLM Purifier] {title}\n{body}\n{sep}")
+
+    @staticmethod
+    def _preview(text: str, n: int = 50) -> str:
+        return text[:n].replace("\n", "\\n") + ("..." if len(text) > n else "")
+
+    def detect_rich_types(self, text: str) -> list[str]:
+        """按配置返回命中的复杂格式类别名称。"""
+        if not self._t2i_cfg("enable"):
+            return []
+        hits = []
+        if self._t2i_cfg("formula") and FORMULA_PATTERN.search(text):
+            hits.append("数学公式")
+        if self._t2i_cfg("table") and (TABLE_PATTERN.search(text) or HTML_TABLE_PATTERN.search(text)):
+            hits.append("表格")
+        if self._t2i_cfg("code_block") and CODE_BLOCK_PATTERN.search(text):
+            hits.append("多行代码块")
+        if self._t2i_cfg("nested_list", False) and NESTED_LIST_PATTERN.search(text):
+            hits.append("多级嵌套列表")
+        return hits
 
     def has_rich_content(self, text: str) -> bool:
         """按配置检测文本中是否含有公式、表格、多行代码块或嵌套列表等剥离后难以阅读的格式"""
-        if not self._t2i_cfg("enable"):
-            return False
-        if self._t2i_cfg("formula") and FORMULA_PATTERN.search(text):
-            return True
-        if self._t2i_cfg("table") and (TABLE_PATTERN.search(text) or HTML_TABLE_PATTERN.search(text)):
-            return True
-        if self._t2i_cfg("code_block") and CODE_BLOCK_PATTERN.search(text):
-            return True
-        if self._t2i_cfg("nested_list", False) and NESTED_LIST_PATTERN.search(text):
-            return True
-        return False
+        return bool(self.detect_rich_types(text))
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse, *args):
@@ -344,11 +362,15 @@ class LLMPurifierPlugin(Star):
             no_thinking_text = original_text
 
         # 2. 含公式/表格时不剥离 Markdown，改走官方文转图（保留排版供渲染）
-        if self.has_rich_content(no_thinking_text):
+        rich_types = self.detect_rich_types(no_thinking_text)
+        if rich_types:
             if original_text != no_thinking_text:
                 resp.completion_text = no_thinking_text
             event.set_extra(T2I_FLAG_KEY, True)
-            logger.info("[LLM Purifier] 检测到公式/表格等复杂格式，保留 Markdown 并标记文转图发送")
+            self._log_box(
+                "检测到复杂格式，保留 Markdown 并整段转图发送:",
+                [f"类型: {'、'.join(rich_types)}", f"原文: {self._preview(no_thinking_text)}"],
+            )
             return
 
         # 3. 再移除Markdown格式（可配置）
@@ -359,11 +381,10 @@ class LLMPurifierPlugin(Star):
         
         if cleaned_text and original_text != cleaned_text:
             resp.completion_text = cleaned_text
-            # 使用 logger 提醒
-            original_preview = original_text[:50].replace('\n', '\\n')
-            cleaned_preview = cleaned_text[:50].replace('\n', '\\n')
-            log_msg = f"\n[LLM Purifier] --------------------------------------------------\n[LLM Purifier] 检测到特定格式并移除:\n[LLM Purifier] 原文: {original_preview}...\n[LLM Purifier] 处理: {cleaned_preview}...\n[LLM Purifier] --------------------------------------------------"
-            logger.warning(log_msg)
+            self._log_box(
+                "检测到特定格式并移除:",
+                [f"原文: {self._preview(original_text)}", f"处理: {self._preview(cleaned_text)}"],
+            )
 
     def _build_render_options(self) -> dict:
         """按配置组装渲染参数（透传给官方 t2i 渲染端点）"""
