@@ -5,6 +5,7 @@ from astrbot.api.message_components import At, Image, Plain
 from astrbot.api import logger, AstrBotConfig
 from collections import OrderedDict
 import re
+import time
 
 # 公式检测：$$...$$、\[...\]、\(...\)、常见 LaTeX 命令、行内 $...$（内含反斜杠命令或 ^/_ 上下标）
 FORMULA_PATTERN = re.compile(
@@ -25,12 +26,64 @@ NESTED_LIST_PATTERN = re.compile(r"^(?: {2,}|\t+)(?:[-*+]|\d+[.)])\s+\S", re.MUL
 
 T2I_FLAG_KEY = "llm_purifier_force_t2i"
 
+# 处理范围（参考 astrbot_plugin_meme_manager 的触发范围设计）
+SCOPE_CHAT_ONLY = "only_chat_llm"
+SCOPE_CHAT_AND_PLUGIN = "chat_and_plugin_llm"
+ORIGIN_EXTRA_KEY = "llm_purifier_llm_request_origin"
+ORIGIN_CHAT = "chat"
+ORIGIN_PLUGIN = "plugin"
+
+# 兼容旧版 AstrBot：没有 on_waiting_llm_request 钩子时不注册来源标记
+_on_waiting_llm_request = getattr(filter, "on_waiting_llm_request", None)
+
+# 假 @ 标记：[CQ:at,qq=123]、{{AT:123}}、[at:123]/[at:昵称]，以及裸 @（后续手动解析 QQ 号或昵称）。
+# 裸 @ 前不能是字母数字或点，避免把邮箱地址误当成 @。
+FAKE_AT_PATTERN = re.compile(
+    r"\[CQ:at,qq=(?P<cq>\d+|all)[^\]]*\]"
+    r"|\{\{\s*AT\s*[:：]\s*(?P<mk>[^{}\n]+?)\s*\}\}"
+    r"|\[\s*at\s*[:：]\s*(?P<br>[^\[\]\n]+?)\s*\]"
+    r"|(?<![A-Za-z0-9_.])[@＠]",
+    re.IGNORECASE,
+)
+# 快速判断文本里是否可能有假 @
+FAKE_AT_HINT = re.compile(r"[@＠]|\[\s*at\s*[:：]|\{\{\s*AT|\[CQ:at", re.IGNORECASE)
+QQ_PATTERN = re.compile(r"\d{5,12}")
+# 昵称后跟括号 QQ 号：小明(123456) / 小明（123456）
+NAME_WITH_QQ_PATTERN = re.compile(r"[^\s@＠()（）\[\]]{1,32}?\s*[(（]\s*(\d{5,12})\s*[)）]")
+# 群成员列表缓存时长（秒）
+MEMBER_CACHE_TTL = 600
+
 class LLMPurifierPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.config = config or {}
-        # 群昵称到账号的短期缓存，用于把模型输出的“@昵称”解析成真正的 At。
+        # 群昵称 -> QQ 号的短期缓存（来自群聊发言者与消息中的 At），用于解析“@昵称”。
         self._group_name_to_qq: dict[str, OrderedDict[str, str]] = {}
+        # 群成员列表缓存：group_id -> (获取时间, {名字: QQ号})
+        self._member_cache: dict[str, tuple[float, dict[str, str]]] = {}
+
+    def _scope(self) -> str:
+        value = str(self.config.get("scope") or SCOPE_CHAT_ONLY).strip().lower()
+        return SCOPE_CHAT_AND_PLUGIN if value == SCOPE_CHAT_AND_PLUGIN else SCOPE_CHAT_ONLY
+
+    def _scope_allows(self, event) -> bool:
+        """按配置判断本轮 LLM 回复的来源是否在处理范围内。"""
+        try:
+            origin = event.get_extra(ORIGIN_EXTRA_KEY)
+        except Exception:
+            origin = None
+        if origin == ORIGIN_PLUGIN:
+            return self._scope() == SCOPE_CHAT_AND_PLUGIN
+        # 普通聊天；或旧版 AstrBot 无法标记来源时，按普通聊天处理
+        return True
+
+    if _on_waiting_llm_request is not None:
+
+        @_on_waiting_llm_request(priority=99999)
+        async def mark_llm_request_origin(self, event: AstrMessageEvent):
+            """在框架构建默认请求前记录来源：已存在 provider_request 说明是插件调用 event.request_llm。"""
+            origin = ORIGIN_PLUGIN if event.get_extra("provider_request") is not None else ORIGIN_CHAT
+            event.set_extra(ORIGIN_EXTRA_KEY, origin)
 
     def _cfg(self, key: str, default: bool = True) -> bool:
         v = self.config.get(key)
@@ -49,96 +102,213 @@ class LLMPurifierPlugin(Star):
             self._group_name_to_qq[key] = cache
         return cache
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
-    async def on_group_message(self, event: AstrMessageEvent):
-        """记录群里最近出现的昵称和账号，供句首假 @ 解析使用。"""
-        group_id = event.get_group_id()
-        sender_id = event.get_sender_id()
-        sender_name = event.get_sender_name()
-        if not group_id or sender_id is None or not sender_name:
+    def _remember_name(self, group_id, name, qq) -> None:
+        name = str(name or "").strip()
+        qq = str(qq or "").strip()
+        if not group_id or not name or not qq or qq == "all":
             return
-        name = str(sender_name).strip()
-        if not name:
-            return
-
         cache = self._get_group_cache(group_id)
-        cache[name] = str(sender_id)
+        cache[name] = qq
         cache.move_to_end(name)
-        while len(cache) > 100:
+        while len(cache) > 200:
             cache.popitem(last=False)
 
-    @staticmethod
-    def _at_head_match(text: str):
-        """匹配参考插件支持的句首假 @ 写法。"""
-        return re.match(
-            r"^\s*(?:"
-            r"\[at[:：]\s*(\d+)\]"
-            r"|\[at[:：]\s*([^\]]+)\]"
-            r"|@(\d{5,12})"
-            r"|@([\u4e00-\u9fa5\w-]{2,20})"
-            r")\s*",
-            text,
-            re.IGNORECASE,
-        )
-
-    def _insert_at(self, chain, qq=None):
-        """在第一段文本前插入真实 At。"""
-        for index, component in enumerate(chain):
-            if not isinstance(component, Plain):
-                continue
-            if qq:
-                # 零宽字符可避免部分平台吞掉 At 后紧邻文本的首字符。
-                chain.insert(index, At(qq=qq))
-                chain.insert(index + 1, Plain("\u200b"))
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
+    async def on_group_message(self, event: AstrMessageEvent):
+        """记录群里最近出现的昵称和账号（含消息中 At 的对象），供假 @ 解析使用。"""
+        group_id = event.get_group_id()
+        if not group_id:
             return
-        if qq:
-            chain.append(At(qq=qq))
+        self._remember_name(group_id, event.get_sender_name(), event.get_sender_id())
+        try:
+            for comp in event.get_messages() or []:
+                if isinstance(comp, At):
+                    self._remember_name(group_id, getattr(comp, "name", ""), comp.qq)
+        except Exception:
+            pass
 
-    def _parse_fake_at(self, event, chain):
-        """返回 (文本组件索引, QQ号)，不修改消息链。"""
+    async def _get_member_names(self, event, group_id) -> dict[str, str]:
+        """通过 OneBot 接口获取群成员名片/昵称 -> QQ 号映射（带缓存，仅 aiocqhttp）。"""
+        key = str(group_id)
+        cached = self._member_cache.get(key)
+        if cached and time.time() - cached[0] < MEMBER_CACHE_TTL:
+            return cached[1]
+        bot = getattr(event, "bot", None)
+        api = getattr(bot, "api", None)
+        if api is None or not hasattr(api, "call_action"):
+            return {}
+        try:
+            members = await api.call_action("get_group_member_list", group_id=int(group_id))
+        except Exception as e:
+            logger.debug(f"[LLM Purifier] 获取群成员列表失败: {e}")
+            self._member_cache[key] = (time.time(), cached[1] if cached else {})
+            return cached[1] if cached else {}
+        mapping: dict[str, str] = {}
+        for m in members or []:
+            qq = str(m.get("user_id", "") or "")
+            if not qq:
+                continue
+            # 群名片优先，其次 QQ 昵称；同名时不覆盖先出现的
+            for name in (m.get("card"), m.get("nickname")):
+                name = str(name or "").strip()
+                if name and name not in mapping:
+                    mapping[name] = qq
+        self._member_cache[key] = (time.time(), mapping)
+        return mapping
+
+    async def _build_name_map(self, event, need_members: bool) -> dict[str, str]:
         try:
             group_id = event.get_group_id()
         except Exception:
             group_id = ""
-        cache = self._get_group_cache(group_id)
+        if not group_id:
+            return {}
+        names: dict[str, str] = {}
+        if need_members:
+            names.update(await self._get_member_names(event, group_id))
+        # 最近发言者缓存优先级最高（最贴近模型看到的称呼）
+        names.update(self._get_group_cache(group_id))
+        return names
 
-        for index, component in enumerate(chain):
-            if not isinstance(component, Plain) or not component.text:
+    @staticmethod
+    def _resolve_target(value: str, names: dict[str, str]) -> str | None:
+        """把标记里的值（QQ 号或昵称）解析成 QQ 号。"""
+        value = (value or "").strip().lstrip("@＠").strip()
+        if not value:
+            return None
+        m = re.fullmatch(r"(?:.*?[(（]\s*)?(\d{5,12})\s*[)）]?", value)
+        if m:
+            return m.group(1)
+        if value.lower() == "all":
+            return None
+        return names.get(value)
+
+    @staticmethod
+    def _resolve_bare_at(rest: str, names: dict[str, str], sorted_names: list[str]):
+        """解析裸 @ 之后的文本，返回 (QQ号, 消耗的字符数)；无法解析返回 (None, 0)。"""
+        m = re.match(r"\s?(\d{5,12})(?!\d)", rest)
+        if m:
+            end = m.end()
+            # 吞掉可能跟随的 (昵称) 写法以外的内容不做处理
+            return m.group(1), end
+        m = NAME_WITH_QQ_PATTERN.match(rest)
+        if m:
+            return m.group(1), m.end()
+        for name in sorted_names:
+            if rest.startswith(name):
+                end = len(name)
+                tail = re.match(r"\s*[(（]\s*\d{5,12}\s*[)）]", rest[end:])
+                if tail:
+                    end += tail.end()
+                return names[name], end
+        return None, 0
+
+    def _split_plain(self, text: str, names, sorted_names) -> list:
+        """把一段文本拆成 Plain / At 组件列表。"""
+        parts: list = []
+        buf = ""
+        pos = 0
+        while True:
+            m = FAKE_AT_PATTERN.search(text, pos)
+            if not m:
+                break
+            buf += text[pos : m.start()]
+            qq, end = None, m.end()
+            if m.group("cq") is not None:
+                qq = m.group("cq") if m.group("cq") != "all" else None
+            elif m.group("mk") is not None:
+                qq = self._resolve_target(m.group("mk"), names)
+            elif m.group("br") is not None:
+                qq = self._resolve_target(m.group("br"), names)
+            else:
+                qq, used = self._resolve_bare_at(text[m.end() :], names, sorted_names)
+                end = m.end() + used
+            if qq:
+                if buf:
+                    parts.append(Plain(buf))
+                    buf = ""
+                parts.append(At(qq=qq))
+            else:
+                buf += text[m.start() : end]
+            pos = end
+        buf += text[pos:]
+        if buf:
+            parts.append(Plain(buf))
+        return parts
+
+    @staticmethod
+    def _tidy_at_spacing(chain: list) -> list:
+        """清理 At 前后多余空白，并在 At 后补一个空格，避免文本与 @ 粘连。"""
+        out: list = []
+        for i, comp in enumerate(chain):
+            if isinstance(comp, Plain):
+                text = comp.text
+                prev = chain[i - 1] if i > 0 else None
+                nxt = chain[i + 1] if i + 1 < len(chain) else None
+                if isinstance(prev, At):
+                    text = text.lstrip(" \t\u200b")
+                    # 紧跟换行时保持原样，不在换行前插空格
+                    if not text.startswith(("\n", "\r")):
+                        text = " " + text
+                if isinstance(nxt, At):
+                    text = text.rstrip(" \t")
+                if text.strip(" \t\u200b") or "\n" in text:
+                    out.append(Plain(text))
                 continue
-            match = self._at_head_match(component.text)
-            if not match:
-                return None, None
+            out.append(comp)
+            if isinstance(comp, At):
+                nxt = chain[i + 1] if i + 1 < len(chain) else None
+                if not isinstance(nxt, Plain) or not nxt.text.strip(" \t\u200b"):
+                    out.append(Plain(" "))
+        # 去掉链首仅含空格的文本段（含换行的保留）
+        while (
+            out
+            and isinstance(out[0], Plain)
+            and not out[0].text.strip(" \t\u200b")
+        ):
+            out.pop(0)
+        return out
 
-            qq = match.group(1) or match.group(3)
-            nickname = match.group(2) or match.group(4)
-            if not qq and nickname:
-                qq = cache.get(nickname.strip())
-            return index, qq
-
-        return None, None
-
-    def _apply_fake_at(self, chain, index, qq):
-        if index is None or index >= len(chain):
+    async def _process_at(self, event, result) -> None:
+        """将 LLM 输出中的假 @（@昵称、@QQ号、[at:xx]、{{AT:xx}}、[CQ:at,qq=xx]）转换成真实 At 组件。"""
+        if not result or not result.chain:
             return
-        component = chain[index]
-        if not isinstance(component, Plain):
+        try:
+            if not event.get_group_id():
+                return
+        except Exception:
             return
-
-        match = self._at_head_match(component.text)
-        if not match or not qq:
-            return
-        component.text = component.text[match.end() :]
-        if not component.text:
-            chain.pop(index)
-        self._insert_at(chain, qq=qq)
-
-    def _process_at(self, event, result):
-        """将 LLM 输出句首的假 @ 转换成真实 At 组件。"""
-        if not result.chain or not result.is_llm_result():
+        texts = [c.text for c in result.chain if isinstance(c, Plain) and c.text]
+        if not any(FAKE_AT_HINT.search(t) for t in texts):
             return
 
-        index, qq = self._parse_fake_at(event, result.chain)
-        self._apply_fake_at(result.chain, index, qq)
+        # 只有出现“@ + 非数字”或标记里含非数字值时，才需要拉取群成员列表
+        need_members = any(
+            re.search(r"[@＠](?!\s?\d{5,12})\S", t)
+            or re.search(r"\[\s*at\s*[:：]\s*[^\d\s\]]", t, re.IGNORECASE)
+            or re.search(r"\{\{\s*AT\s*[:：]\s*[^\d\s}]", t, re.IGNORECASE)
+            for t in texts
+        )
+        names = await self._build_name_map(event, need_members)
+        sorted_names = sorted(names, key=len, reverse=True)
+
+        new_chain: list = []
+        changed = False
+        for comp in result.chain:
+            if isinstance(comp, Plain) and comp.text and FAKE_AT_HINT.search(comp.text):
+                parts = self._split_plain(comp.text, names, sorted_names)
+                if any(isinstance(p, At) for p in parts):
+                    changed = True
+                new_chain.extend(parts)
+            else:
+                new_chain.append(comp)
+
+        if changed:
+            result.chain = self._tidy_at_spacing(new_chain)
+            logger.info(
+                "[LLM Purifier] 已将假 @ 转换为真实 At: "
+                + ", ".join(str(c.qq) for c in result.chain if isinstance(c, At))
+            )
 
     def has_rich_content(self, text: str) -> bool:
         """按配置检测文本中是否含有公式、表格、多行代码块或嵌套列表等剥离后难以阅读的格式"""
@@ -161,6 +331,8 @@ class LLMPurifierPlugin(Star):
         若含公式/表格等复杂格式，则保留 Markdown 并标记整段转图片发送
         """
         if not resp or not resp.completion_text:
+            return
+        if not self._scope_allows(event):
             return
 
         original_text = resp.completion_text
@@ -238,7 +410,7 @@ class LLMPurifierPlugin(Star):
             tmpl_str, data, return_url=True, options=self._build_render_options()
         )
 
-    @filter.on_decorating_result()
+    @filter.on_decorating_result(priority=10)
     async def on_decorating(self, event: AstrMessageEvent):
         """
         发送前修饰：若本事件被标记为含公式/表格，直接调用官方渲染接口
@@ -248,9 +420,16 @@ class LLMPurifierPlugin(Star):
         result = event.get_result()
         if not result or not result.chain:
             return
+        # 只处理范围内的 LLM 回复；指令、固定文本等普通消息不处理
+        if not result.is_llm_result() or not self._scope_allows(event):
+            return
 
         if not event.get_extra(T2I_FLAG_KEY):
-            self._process_at(event, result)
+            # 仅文本发送时做假 @ 转换；转图后 @ 无意义，不处理
+            try:
+                await self._process_at(event, result)
+            except Exception as e:
+                logger.warning(f"[LLM Purifier] 假 @ 转换失败，保留原文: {e}")
             return
 
         texts = [c.text for c in result.chain if isinstance(c, Plain)]

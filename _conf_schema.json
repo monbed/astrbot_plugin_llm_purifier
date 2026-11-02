@@ -1,4 +1,12 @@
 {
+    "scope": {
+        "type": "string",
+        "description": "应用范围",
+        "options": ["only_chat_llm", "chat_and_plugin_llm"],
+        "labels": ["仅普通聊天回复", "普通聊天与插件触发的回复"],
+        "hint": "仅对所选范围的 LLM 回复执行净化、转图和假 @ 转换；指令和固定文本回复不处理。插件触发指其他插件通过 event.request_llm 发起的 LLM 回复",
+        "default": "only_chat_llm"
+    },
     "remove_thinking": {
         "type": "bool",
         "description": "移除思考过程",
