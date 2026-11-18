@@ -564,7 +564,7 @@ class LLMPurifierPlugin(Star):
     async def on_decorating(self, event: AstrMessageEvent):
         """
         发送前修饰：若本事件被标记为含公式/表格，优先交给官方机器人以 Markdown 主动发送
-        （需在配置中启用）；否则或代发失败时，直接调用官方渲染接口
+        （需在配置中启用）；未代发、代发失败或配置为同时转图发送时，直接调用官方渲染接口
         （跟随 WebUI 可选的 t2i 模板）按配置的清晰度参数渲染，并替换消息链为图片。
         不走框架的 use_t2i 标记，以绕过其 t2i_word_threshold 字数阈值与写死的 quality=40。
         """
@@ -587,10 +587,13 @@ class LLMPurifierPlugin(Star):
         text = "\n".join(t for t in texts if t and t.strip())
         if not text:
             return
-        if await self._relay_to_official(event, text):
+        if await self._relay_to_official(event, text) and not self._relay_cfg().get(
+            "also_send_image"
+        ):
             # 文本已由官方机器人发出，本账号只保留非文本组件（没有则不再发送）
             result.chain = [c for c in result.chain if not isinstance(c, Plain)]
             return
+        # 未代发、代发失败，或配置为同时转图发送：本账号照常转图
         url = None
         try:
             url = await self._render_high_quality(text)

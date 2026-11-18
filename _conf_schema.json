@@ -36,6 +36,12 @@
                 "hint": "每项格式为 QQ群号:群openid，例如 123456789:A44E8413A363E09453BD414E320D3494。只有填写了的群才会交给官方机器人发送。群 openid 是官方机器人该群会话 ID（UMO）的最后一段，会话 ID 形如 机器人ID:GroupMessage:群openid",
                 "default": []
             },
+            "also_send_image": {
+                "type": "bool",
+                "description": "同时转图发送",
+                "hint": "开启后，官方机器人发送 Markdown 的同时，本账号仍照常发送转图图片，群里会出现两条内容相同的回复。关闭时，官方机器人发送成功后本账号不再发送",
+                "default": false
+            },
             "platform_id": {
                 "type": "string",
                 "description": "官方机器人的平台 ID",
