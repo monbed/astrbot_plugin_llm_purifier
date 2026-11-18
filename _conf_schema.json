@@ -19,6 +19,49 @@
         "hint": "移除粗体、标题、链接、列表标记等 Markdown 符号（仅对未触发转图的纯文本回复生效）",
         "default": true
     },
+    "official_relay": {
+        "type": "object",
+        "description": "复杂格式交给官方机器人发送",
+        "hint": "需要转图时，改由同群的 QQ 官方机器人（qq_official）在后台以原生 Markdown 主动发送，群里不需要 @ 它。要求群主已为官方机器人开启「机器人主动在群聊内发言」；发送失败时自动回退为转图。仅群聊生效",
+        "items": {
+            "enable": {
+                "type": "bool",
+                "description": "启用官方机器人代发",
+                "hint": "要求官方机器人与本账号在同一个群，且两个平台都启用了本插件",
+                "default": false
+            },
+            "bot_qq": {
+                "type": "string",
+                "description": "官方机器人的 QQ 号",
+                "hint": "官方机器人在群成员列表里显示的 QQ 号（纯数字）。每个群第一次代发时，本账号会 @ 它并发送一条一次性口令来绑定该群，之后不再出现；已在下方手动映射的群不需要",
+                "default": ""
+            },
+            "platform_id": {
+                "type": "string",
+                "description": "官方机器人的平台 ID",
+                "hint": "AstrBot「机器人」页面里该官方机器人的 ID。留空时自动选择：绑定时响应口令的那个官方机器人，或第一个官方机器人平台。只有同时运行多个官方机器人时才需要填",
+                "default": ""
+            },
+            "group_map": {
+                "type": "list",
+                "description": "手动群映射",
+                "hint": "每项格式为 QQ群号:群openid，例如 123456789:A44E8413A363E09453BD414E320D3494。填写的群跳过口令绑定并以此为准。群 openid 可在官方机器人该群会话的 UMO 末尾找到",
+                "default": []
+            },
+            "timeout": {
+                "type": "int",
+                "description": "绑定等待超时 (秒)",
+                "hint": "发出绑定口令后等待官方机器人响应的时间，超时则转图，并在 5 分钟内不再对该群尝试。范围 3-60",
+                "default": 10
+            },
+            "recall_trigger": {
+                "type": "bool",
+                "description": "撤回绑定口令",
+                "hint": "绑定结束后撤回本账号发出的那条 @ 口令消息",
+                "default": true
+            }
+        }
+    },
     "t2i": {
         "type": "object",
         "description": "复杂格式整段转图",

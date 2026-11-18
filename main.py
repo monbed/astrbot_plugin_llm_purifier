@@ -1,10 +1,13 @@
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star
 from astrbot.api.provider import LLMResponse
 from astrbot.api.message_components import At, Image, Plain
+from astrbot.api.platform import MessageType
 from astrbot.api import logger, AstrBotConfig
 from collections import OrderedDict
+import asyncio
 import re
+import secrets
 import time
 
 # 公式检测：$$...$$、\[...\]、\(...\)、常见 LaTeX 命令、行内 $...$（内含反斜杠命令或 ^/_ 上下标）
@@ -53,6 +56,27 @@ NAME_WITH_QQ_PATTERN = re.compile(r"[^\s@＠()（）\[\]]{1,32}?\s*[(（]\s*(\d{
 # 群成员列表缓存时长（秒）
 MEMBER_CACHE_TTL = 600
 
+# ---- 官方机器人代发（aiocqhttp -> qq_official）----
+# 官方机器人以主动消息把原始 Markdown 发到群里，群里不需要任何人 @ 它。
+# aiocqhttp 用 QQ 群号，官方机器人用 group_openid，两者没有接口可以互查，
+# 所以每个群第一次代发时，由 aiocqhttp 账号 @ 官方机器人并带一次性口令完成绑定。
+RELAY_TOKEN_PREFIX = "mdrelay-"
+RELAY_TOKEN_PATTERN = re.compile(r"mdrelay-([0-9a-f]{8})")
+RELAY_OFFICIAL_PLATFORMS = {"qq_official", "qq_official_webhook"}
+# 等待官方机器人发送接口返回的最长时间（秒），略大于适配器自身的 20 秒超时
+RELAY_SEND_TIMEOUT = 30
+# 某个群绑定或发送失败后，暂停在该群代发的时长（秒），期间直接转图
+RELAY_FAIL_COOLDOWN = 300
+# 绑定关系在插件 KV 中的键：{QQ群号: {"openid": ..., "platform_id": ...}}
+RELAY_KV_KEY = "official_relay_bindings"
+# 手动映射的单项格式：QQ群号:群openid
+RELAY_GROUP_MAP_ITEM = re.compile(r"^\s*(\d{5,12})\s*[:：=]\s*([0-9A-Za-z_\-]{8,})\s*$")
+# 代发时把公式定界符统一成 QQ Markdown 的写法，代码块内不处理
+RELAY_CODE_SPLIT = re.compile(r"(```[\s\S]*?```)")
+RELAY_BLOCK_MATH = re.compile(r"\\\[([\s\S]+?)\\\]|\$\$([\s\S]+?)\$\$")
+RELAY_INLINE_MATH = re.compile(r"\\\(([\s\S]+?)\\\)")
+
+
 class LLMPurifierPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -61,6 +85,39 @@ class LLMPurifierPlugin(Star):
         self._group_name_to_qq: dict[str, OrderedDict[str, str]] = {}
         # 群成员列表缓存：group_id -> (获取时间, {名字: QQ号})
         self._member_cache: dict[str, tuple[float, dict[str, str]]] = {}
+        # 官方机器人代发：绑定口令 -> 等待官方机器人回报本群 openid 的 Future
+        self._relay_pending: dict[str, asyncio.Future] = {}
+        # 官方机器人代发：QQ 群号 -> {"openid": 群 openid, "platform_id": 官方机器人平台 ID}
+        self._relay_bindings: dict[str, dict[str, str]] = {}
+        # 官方机器人代发：QQ 群号 -> 绑定握手锁，避免同一个群同时发出多条口令
+        self._relay_bind_locks: dict[str, asyncio.Lock] = {}
+        # 官方机器人代发：群号 -> 暂停代发的截止时间
+        self._relay_fail_until: dict[str, float] = {}
+
+    async def initialize(self):
+        """读取已保存的「QQ 群号 -> 官方机器人群 openid」绑定。"""
+        if not hasattr(self, "get_kv_data"):
+            return  # 旧版 AstrBot 没有 KV 存储，绑定只保存在内存里
+        try:
+            data = await self.get_kv_data(RELAY_KV_KEY, {})
+        except Exception as e:
+            logger.error(f"[LLM Purifier] 读取官方机器人群绑定失败: {e}", exc_info=True)
+            return
+        if not isinstance(data, dict):
+            return
+        for group_id, item in data.items():
+            if isinstance(item, dict) and item.get("openid"):
+                self._relay_bindings[str(group_id)] = {
+                    "openid": str(item["openid"]),
+                    "platform_id": str(item.get("platform_id") or ""),
+                }
+
+    async def terminate(self):
+        """结束仍在等待的绑定握手，让对应的回复回退为转图。"""
+        for fut in self._relay_pending.values():
+            if not fut.done():
+                fut.set_result(None)
+        self._relay_pending.clear()
 
     def _scope(self) -> str:
         value = str(self.config.get("scope") or SCOPE_CHAT_ONLY).strip().lower()
@@ -431,10 +488,227 @@ class LLMPurifierPlugin(Star):
             tmpl_str, data, return_url=True, options=self._build_render_options()
         )
 
+    def _relay_cfg(self) -> dict:
+        relay = self.config.get("official_relay")
+        return relay if isinstance(relay, dict) else {}
+
+    @staticmethod
+    def _to_qq_markdown(text: str) -> str:
+        """把公式定界符统一成 QQ Markdown 的写法：行内 $...$，块公式的 $$ 各占一行且前后留空行。"""
+        segments = RELAY_CODE_SPLIT.split(text)
+        for i in range(0, len(segments), 2):  # 奇数下标是代码块，原样保留
+            seg = RELAY_BLOCK_MATH.sub(
+                lambda m: f"\n\n$$\n{(m.group(1) or m.group(2)).strip()}\n$$\n\n",
+                segments[i],
+            )
+            seg = RELAY_INLINE_MATH.sub(lambda m: f"${m.group(1).strip()}$", seg)
+            segments[i] = re.sub(r"\n{3,}", "\n\n", seg)
+        return "".join(segments).strip()
+
+    def _relay_manual_map(self) -> dict[str, str]:
+        """解析配置里手动填写的「QQ群号:群openid」映射。"""
+        items = self._relay_cfg().get("group_map") or []
+        if isinstance(items, str):
+            items = items.splitlines()
+        if not isinstance(items, list):
+            return {}
+        mapping: dict[str, str] = {}
+        for item in items:
+            m = RELAY_GROUP_MAP_ITEM.match(str(item))
+            if m:
+                mapping[m.group(1)] = m.group(2)
+        return mapping
+
+    def _relay_platform(self, bound_platform_id: str = ""):
+        """找到用于代发的官方机器人平台实例。
+
+        配置里指定了平台 ID 时只用它；否则用绑定时记录的平台，找不到再取第一个官方机器人平台。
+        """
+        configured = str(self._relay_cfg().get("platform_id") or "").strip()
+        wanted = configured or bound_platform_id
+        try:
+            insts = list(self.context.platform_manager.get_insts())
+        except Exception as e:
+            logger.error(f"[LLM Purifier] 获取平台列表失败: {e}", exc_info=True)
+            return None
+        first = None
+        for inst in insts:
+            try:
+                meta = inst.meta()
+            except Exception:
+                continue
+            if meta.name not in RELAY_OFFICIAL_PLATFORMS:
+                continue
+            if wanted and meta.id == wanted:
+                return inst
+            if first is None:
+                first = inst
+        return None if configured else first
+
+    async def _relay_save_bindings(self) -> None:
+        """把绑定关系写入插件 KV。"""
+        if not hasattr(self, "put_kv_data"):
+            return
+        try:
+            await self.put_kv_data(RELAY_KV_KEY, dict(self._relay_bindings))
+        except Exception as e:
+            logger.error(f"[LLM Purifier] 保存官方机器人群绑定失败: {e}", exc_info=True)
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=100000)
+    async def on_official_relay_trigger(self, event: AstrMessageEvent):
+        """官方机器人收到 aiocqhttp 侧的绑定口令后，回报本群的 openid。"""
+        if event.get_platform_name() not in RELAY_OFFICIAL_PLATFORMS:
+            return
+        if not self._relay_cfg().get("enable"):
+            return
+        m = RELAY_TOKEN_PATTERN.search(event.message_str or "")
+        if not m:
+            return
+        # 口令消息只用于绑定，不交给其他插件和 LLM
+        event.stop_event()
+        fut = self._relay_pending.get(m.group(1))
+        if fut is None or fut.done():
+            logger.debug("[LLM Purifier] 收到已失效的绑定口令，忽略")
+            return
+        # 只有 QQ 群消息带 group_openid；频道子频道的消息不能用于绑定
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        openid = str(getattr(raw, "group_openid", "") or "")
+        if not openid:
+            logger.debug("[LLM Purifier] 绑定口令不是来自 QQ 群，忽略")
+            return
+        fut.set_result({"openid": openid, "platform_id": str(event.get_platform_id() or "")})
+
+    async def _relay_bind(self, event: AstrMessageEvent, group_id: str) -> dict | None:
+        """一次性握手：@ 官方机器人并带口令，等它回报本群 openid，成功后保存绑定。"""
+        relay = self._relay_cfg()
+        bot_qq = str(relay.get("bot_qq") or "").strip()
+        if not bot_qq.isdigit():
+            logger.warning(
+                f"[LLM Purifier] 群 {group_id} 尚未绑定官方机器人，且未填写官方机器人的 QQ 号，改为转图"
+            )
+            return None
+        api = getattr(getattr(event, "bot", None), "api", None)
+        if api is None or not hasattr(api, "call_action"):
+            return None
+        try:
+            timeout = min(60, max(3, int(relay.get("timeout") or 10)))
+        except (TypeError, ValueError):
+            timeout = 10
+
+        token = secrets.token_hex(4)
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._relay_pending[token] = fut
+        trigger_id = None
+        binding = None
+        try:
+            ret = await api.call_action(
+                "send_group_msg",
+                group_id=int(group_id),
+                message=[
+                    {"type": "at", "data": {"qq": bot_qq}},
+                    {"type": "text", "data": {"text": f" {RELAY_TOKEN_PREFIX}{token}"}},
+                ],
+            )
+            if isinstance(ret, dict):
+                trigger_id = ret.get("message_id")
+            binding = await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            self._relay_fail_until[group_id] = time.time() + RELAY_FAIL_COOLDOWN
+            logger.warning(
+                f"[LLM Purifier] 群 {group_id} 内 {timeout} 秒未等到官方机器人响应，绑定失败，"
+                f"改为转图，并在 {RELAY_FAIL_COOLDOWN} 秒内不再尝试"
+            )
+        except Exception as e:
+            logger.error(f"[LLM Purifier] 发送绑定口令失败: {e}", exc_info=True)
+        finally:
+            self._relay_pending.pop(token, None)
+            if trigger_id is not None and relay.get("recall_trigger", True):
+                try:
+                    await api.call_action("delete_msg", message_id=trigger_id)
+                except Exception as e:
+                    logger.debug(f"[LLM Purifier] 撤回绑定口令失败: {e}")
+        if not binding:
+            return None
+        self._relay_bindings[group_id] = binding
+        await self._relay_save_bindings()
+        self._log_box(
+            "已绑定官方机器人所在的群，此后在后台代发:",
+            [f"群: {group_id}", f"群 openid: {binding['openid'][:8]}..."],
+        )
+        return binding
+
+    async def _relay_to_official(self, event: AstrMessageEvent, text: str) -> bool:
+        """让官方机器人以主动消息把 Markdown 发到本群，返回是否已发出。"""
+        if not self._relay_cfg().get("enable") or event.get_platform_name() != "aiocqhttp":
+            return False
+        group_id = str(event.get_group_id() or "")
+        if not group_id.isdigit():
+            return False  # 私聊不代发
+        if time.time() < self._relay_fail_until.get(group_id, 0):
+            return False
+
+        # 手动映射优先；否则用已保存的绑定；都没有时做一次口令握手
+        manual_openid = self._relay_manual_map().get(group_id)
+        if manual_openid:
+            binding = {"openid": manual_openid, "platform_id": ""}
+        else:
+            binding = self._relay_bindings.get(group_id)
+            if binding is None:
+                lock = self._relay_bind_locks.setdefault(group_id, asyncio.Lock())
+                async with lock:
+                    binding = self._relay_bindings.get(group_id)
+                    if binding is None:
+                        binding = await self._relay_bind(event, group_id)
+            if binding is None:
+                return False
+
+        platform = self._relay_platform(binding.get("platform_id", ""))
+        if platform is None:
+            self._relay_fail_until[group_id] = time.time() + RELAY_FAIL_COOLDOWN
+            logger.warning("[LLM Purifier] 找不到用于代发的官方机器人平台，改为转图")
+            return False
+        # 旧版适配器在没有可回复的消息 ID 时会静默跳过发送，插件无法得知是否发出，
+        # 所以确认适配器支持群主动消息后才代发；这里只读内部标记，没有公开接口可查。
+        if not getattr(platform, "_allow_group_proactive_send", False) or not hasattr(
+            platform, "remember_session_scene"
+        ):
+            self._relay_fail_until[group_id] = time.time() + RELAY_FAIL_COOLDOWN
+            logger.warning("[LLM Purifier] 当前 AstrBot 版本的官方机器人适配器不支持群主动消息，改为转图")
+            return False
+
+        openid = binding["openid"]
+        try:
+            # AstrBot 重启后适配器不记得该会话属于 QQ 群，不补上会被当作无法发送而跳过
+            platform.remember_session_scene(openid, "group")
+            chain = MessageChain().message(self._to_qq_markdown(text))
+            if hasattr(chain, "use_markdown"):
+                chain.use_markdown(True)
+            umo = f"{platform.meta().id}:{MessageType.GROUP_MESSAGE.value}:{openid}"
+            sent = await asyncio.wait_for(
+                self.context.send_message(umo, chain), RELAY_SEND_TIMEOUT
+            )
+        except Exception as e:
+            self._relay_fail_until[group_id] = time.time() + RELAY_FAIL_COOLDOWN
+            logger.error(
+                f"[LLM Purifier] 官方机器人在群 {group_id} 主动发送失败，改为转图，"
+                f"并在 {RELAY_FAIL_COOLDOWN} 秒内不再尝试（请确认群主已开启「机器人主动在群聊内发言」）: "
+                f"{e or type(e).__name__}",
+                exc_info=True,
+            )
+            return False
+        if not sent:
+            return False
+        self._log_box(
+            "复杂格式已交由官方机器人以 Markdown 发送:",
+            [f"群: {group_id}", f"原文: {self._preview(text)}"],
+        )
+        return True
+
     @filter.on_decorating_result(priority=10)
     async def on_decorating(self, event: AstrMessageEvent):
         """
-        发送前修饰：若本事件被标记为含公式/表格，直接调用官方渲染接口
+        发送前修饰：若本事件被标记为含公式/表格，优先交给官方机器人以 Markdown 主动发送
+        （需在配置中启用）；否则或代发失败时，直接调用官方渲染接口
         （跟随 WebUI 可选的 t2i 模板）按配置的清晰度参数渲染，并替换消息链为图片。
         不走框架的 use_t2i 标记，以绕过其 t2i_word_threshold 字数阈值与写死的 quality=40。
         """
@@ -456,6 +730,10 @@ class LLMPurifierPlugin(Star):
         texts = [c.text for c in result.chain if isinstance(c, Plain)]
         text = "\n".join(t for t in texts if t and t.strip())
         if not text:
+            return
+        if await self._relay_to_official(event, text):
+            # 文本已由官方机器人发出，本账号只保留非文本组件（没有则不再发送）
+            result.chain = [c for c in result.chain if not isinstance(c, Plain)]
             return
         url = None
         try:
